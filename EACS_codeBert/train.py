@@ -11,7 +11,6 @@ import random
 from tqdm import tqdm
 from itertools import cycle
 import json
-import platform
 import sys
 
 import bleu
@@ -22,14 +21,10 @@ from transformers import AdamW, get_linear_schedule_with_warmup, \
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-transformer_path = r'I:\project\codebert-base'
-
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-sysstr = platform.system()
 
 
 def set_seed(args):
@@ -246,16 +241,11 @@ def main(language):
     tokenizer = None
     encoder = None
 
-    if sysstr == 'Linux':
-        config = RobertaConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
-        tokenizer = RobertaTokenizer.from_pretrained(
-            args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
-            do_lower_case=args.do_lower_case)
-        encoder = RobertaModel.from_pretrained(args.model_name_or_path, config=config)
-    elif sysstr == 'Windows':
-        config = RobertaConfig.from_pretrained(transformer_path)
-        tokenizer = RobertaTokenizer.from_pretrained(transformer_path)
-        encoder = RobertaModel.from_pretrained(transformer_path, config=config)
+    config = RobertaConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
+    tokenizer = RobertaTokenizer.from_pretrained(
+        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+        do_lower_case=args.do_lower_case)
+    encoder = RobertaModel.from_pretrained(args.model_name_or_path, config=config)
 
     decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
     decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)

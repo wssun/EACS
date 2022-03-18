@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
@@ -10,24 +11,19 @@ import random
 from tqdm import tqdm
 from itertools import cycle
 import json
-import jsonlines
-import platform
-
-from model import SelectorNet
+import bleu
+from model import Seq2Seq
+import sys
 
 from transformers import AdamW, get_linear_schedule_with_warmup, \
     RobertaConfig, RobertaModel, RobertaTokenizer
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
-
-transformer_path = r'I:\project\codebert-base'
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-sysstr = platform.system()
 
 
 def set_seed(args):
@@ -40,22 +36,29 @@ def set_seed(args):
 
 
 class Example(object):
-    def __init__(self, idx, source, labels):
+    def __init__(self, idx, ex_source, ab_source, target):
         self.idx = idx
-        self.source = source
-        self.labels = labels
+        self.ex_source = ex_source
+        self.ab_source = ab_source
+        self.target = target
 
 
 class InputFeatures(object):
-    def __init__(self, example_id, source_ids, word_masks, stat_masks, labels):
-        self.word_masks = word_masks
+    def __init__(self, example_id, ex_source_ids, ex_source_mask,
+                 ab_source_ids, ab_source_mask, target_ids, target_mask):
         self.example_id = example_id
-        self.source_ids = source_ids
-        self.stat_masks = stat_masks
-        self.labels = labels
+
+        self.ex_source_ids = ex_source_ids
+        self.ex_source_mask = ex_source_mask
+
+        self.ab_source_ids = ab_source_ids
+        self.ab_source_mask = ab_source_mask
+
+        self.target_ids = target_ids
+        self.target_mask = target_mask
 
 
-def read_examples(filename, code_type):
+def read_examples(filename, ex_dataset, ab_dataset):
     examples = []
     with open(filename, encoding="utf-8") as f:
         for idx, line in tqdm(enumerate(f)):
@@ -64,64 +67,85 @@ def read_examples(filename, code_type):
             if 'idx' not in js:
                 js['idx'] = idx
 
-            code = [i.replace('\n', ' ') for i in js[code_type]]
-            labels = js['ex_labels']
+            if np.sum(js['cleaned_seqs_pred']) == 0:
+                ex_code = ' '.join(js[ex_dataset]).replace('\n', '')
+            else:
+                ex_code_list = []
+                for index, i in enumerate(js['cleaned_seqs_pred']):
+                    if i == 1:
+                        ex_code_list.append(js[ex_dataset][index])
+                ex_code = ' '.join(ex_code_list).replace('\n', '')
+
+            ex_code = ' '.join(ex_code.strip().split())
+
+            ab_code = ' '.join(js[ab_dataset]).replace('\n', '')
+            ab_code = ' '.join(ab_code.strip().split())
+            nl = ' '.join(js['cleaned_nl']).replace('\n', '')
+            nl = ' '.join(nl.strip().split())
+
             examples.append(
                 Example(
                     idx=idx,
-                    source=code,
-                    labels=labels,
+                    ex_source=ex_code,
+                    ab_source=ab_code,
+                    target=nl
                 )
             )
 
-            # if idx > 30:
+            # if idx > 300:
             #     break
 
     return examples
 
 
-def convert_examples_to_features(examples, tokenizer, args, word_length=None, stat_length=None):
+def convert_examples_to_features(args, examples, tokenizer, code_length_ex=None, code_length_ab=None, stage=None):
     features = []
     for example_index, example in tqdm(enumerate(examples)):
-        source_ids = []
-        word_masks = []
 
-        # source
-        for i in example.source[:stat_length]:
-            stat_tokens = tokenizer.tokenize(i)[:word_length]
-            stat_ids = tokenizer.convert_tokens_to_ids(stat_tokens)
-            stat_mask = [1] * (len(stat_tokens))
-            padding_length = word_length - len(stat_ids)
-            stat_ids += [tokenizer.pad_token_id] * padding_length
-            stat_mask += [0] * padding_length
+        ex_source_tokens = tokenizer.tokenize(example.ex_source)[:code_length_ex - 2]
+        ex_source_tokens = [tokenizer.cls_token] + ex_source_tokens + [tokenizer.sep_token]
+        ex_source_ids = tokenizer.convert_tokens_to_ids(ex_source_tokens)
+        ex_source_mask = [1] * (len(ex_source_tokens))
+        padding_length = code_length_ex - len(ex_source_ids)
+        ex_source_ids += [tokenizer.pad_token_id] * padding_length
+        ex_source_mask += [0] * padding_length
 
-            source_ids.append(stat_ids)
-            word_masks.append(stat_mask)
+        ab_source_tokens = tokenizer.tokenize(example.ab_source)[:code_length_ab - 2]
+        ab_source_tokens = [tokenizer.cls_token] + ab_source_tokens + [tokenizer.sep_token]
+        ab_source_ids = tokenizer.convert_tokens_to_ids(ab_source_tokens)
+        ab_source_mask = [1] * (len(ab_source_tokens))
+        padding_length = code_length_ab - len(ab_source_ids)
+        ab_source_ids += [tokenizer.pad_token_id] * padding_length
+        ab_source_mask += [0] * padding_length
 
-        stat_masks = [1] * (len(source_ids))
-        padding_length = stat_length - len(source_ids)
-        stat_masks += [0] * padding_length
-        source_ids += [[tokenizer.pad_token_id] * word_length] * padding_length
-        word_masks += [[0] * word_length] * padding_length
-
-        labels = example.labels[:stat_length]
-        labels += [0] * padding_length
+        # target
+        if stage == "test":
+            target_tokens = tokenizer.tokenize("None")
+        else:
+            target_tokens = tokenizer.tokenize(example.target)[:args.max_target_length - 2]
+        target_tokens = [tokenizer.cls_token] + target_tokens + [tokenizer.sep_token]
+        target_ids = tokenizer.convert_tokens_to_ids(target_tokens)
+        target_mask = [1] * len(target_ids)
+        padding_length = args.max_target_length - len(target_ids)
+        target_ids += [tokenizer.pad_token_id] * padding_length
+        target_mask += [0] * padding_length
 
         features.append(
             InputFeatures(
                 example_index,
-                source_ids,
-                word_masks,
-                stat_masks,
-                labels
+                ex_source_ids,
+                ex_source_mask,
+                ab_source_ids,
+                ab_source_mask,
+                target_ids,
+                target_mask
             )
         )
     return features
 
 
-def main():
+def main(language):
     parser = argparse.ArgumentParser()
-    language = 'python'
 
     ## Required parameters
     parser.add_argument("--model_type", default='roberta', type=str,
@@ -130,30 +154,29 @@ def main():
                         help="Path to pre-trained model: e.g. roberta-base")
     parser.add_argument("--output_dir", default=f'model/{language}', type=str,
                         help="The output directory where the model predictions and checkpoints will be written.")
-    parser.add_argument("--load_model_path", default=f'model/{language}/checkpoint-best-acc/pytorch_model.bin', type=str,
+    parser.add_argument("--load_model_path", default=f'model/{language}/checkpoint-best-loss/pytorch_model.bin', type=str,
                         help="Path to trained model: Should contain the .bin files")
 
-    parser.add_argument("--train_filename", default=f'../dataset/src-codeBERT/{language}-ex/train.jsonl', type=str,
+    parser.add_argument("--train_filename", default=f'../dataset/src-codeBERT-preds/{language}/train.jsonl', type=str,
                         help="The train filename. Should contain the .jsonl files for this task.")
-    parser.add_argument("--dev_filename", default=f'../dataset/src-codeBERT/{language}-ex/valid.jsonl', type=str,
+    parser.add_argument("--dev_filename", default=f'../dataset/src-codeBERT-preds/{language}/valid.jsonl', type=str,
                         help="The dev filename. Should contain the .jsonl files for this task.")
-    parser.add_argument("--test_filename", default=f'../dataset/src-codeBERT/{language}-ex/test.jsonl', type=str,
+    parser.add_argument("--test_filename", default=f'../dataset/src-codeBERT-preds/{language}/test.jsonl', type=str,
                         help="The test filename. Should contain the .jsonl files for this task.")
-
-    parser.add_argument("--max_word_length", default=32, type=int, help="")
-    parser.add_argument("--max_stat_length", default=32, type=int,
-                        help="The maximum total source sequence length after tokenization. Sequences longer "
-                             "than this will be truncated, sequences shorter will be padded.")
-
-    parser.add_argument("--word_hidden_size", default=128, type=int, help="")
-    parser.add_argument("--stat_hidden_size", default=256, type=int, help="")
-    parser.add_argument("--vocab_size", default=50265, type=int, help="")
-    parser.add_argument("--embed_size", default=768, type=int, help="")
 
     parser.add_argument("--config_name", default="", type=str,
                         help="Pretrained config name or path if not the same as model_name")
     parser.add_argument("--tokenizer_name", default="", type=str,
                         help="Pretrained tokenizer name or path if not the same as model_name")
+    parser.add_argument("--max_source_length_ex", default=128, type=int,
+                        help="The maximum total source sequence length after tokenization. Sequences longer "
+                             "than this will be truncated, sequences shorter will be padded.")
+    parser.add_argument("--max_source_length_ab", default=256, type=int,
+                        help="The maximum total source sequence length after tokenization. Sequences longer "
+                             "than this will be truncated, sequences shorter will be padded.")
+    parser.add_argument("--max_target_length", default=64, type=int,
+                        help="The maximum total target sequence length after tokenization. Sequences longer "
+                             "than this will be truncated, sequences shorter will be padded.")
 
     parser.add_argument("--do_train", default=False,
                         help="Whether to run training.")
@@ -161,8 +184,6 @@ def main():
                         help="Whether to run eval on the dev set.")
     parser.add_argument("--do_test", default=True,
                         help="Whether to run test on the test set.")
-    parser.add_argument("--do_save_ex", default=True,
-                        help="")
 
     parser.add_argument("--train_batch_size", default=32, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -172,7 +193,9 @@ def main():
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
     parser.add_argument("--learning_rate", default=5e-5, type=float,
                         help="The initial learning rate for Adam.")
-    parser.add_argument("--eval_steps", default=500, type=int,
+    parser.add_argument("--beam_size", default=10, type=int,
+                        help="beam size for beam search")
+    parser.add_argument("--eval_steps", default=1000, type=int,
                         help="")
     parser.add_argument("--train_steps", default=50000, type=int,
                         help="")
@@ -200,8 +223,8 @@ def main():
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-        # args.n_gpu = torch.cuda.device_count()
-        args.n_gpu = 1
+        args.n_gpu = torch.cuda.device_count()
+        # args.n_gpu = 1
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
@@ -216,27 +239,22 @@ def main():
     if os.path.exists(args.output_dir) is False:
         os.makedirs(args.output_dir)
 
-    if sysstr == 'Linux':
-        config = RobertaConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
-        tokenizer = RobertaTokenizer.from_pretrained(
-            args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
-            do_lower_case=args.do_lower_case)
-        encoder = RobertaModel.from_pretrained(args.model_name_or_path, config=config)
-    elif sysstr == 'Windows':
-        config = RobertaConfig.from_pretrained(transformer_path)
-        tokenizer = RobertaTokenizer.from_pretrained(transformer_path)
-        encoder = RobertaModel.from_pretrained(transformer_path, config=config)
+    config = RobertaConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
+    tokenizer = RobertaTokenizer.from_pretrained(
+        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+        do_lower_case=args.do_lower_case)
+    encoder = RobertaModel.from_pretrained(args.model_name_or_path, config=config)
 
-    word_embeddings_weight = encoder.embeddings.word_embeddings.weight
-    model = SelectorNet(batch_size=args.train_batch_size, word_embeddings_weight=word_embeddings_weight,
-                        word_hidden_size=args.word_hidden_size, stat_hidden_size=args.stat_hidden_size,
-                        max_word_len=args.max_word_length, max_stat_len=args.max_stat_length,
-                        vocab_size=args.vocab_size, embed_size=args.embed_size, num_classes=2,
-                        imbalance_loss_fct=True)
+    decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
+    decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
+
+    model = Seq2Seq(encoder=encoder, decoder=decoder, config=config,
+                    beam_size=args.beam_size, max_length=args.max_target_length,
+                    sos_id=tokenizer.cls_token_id, eos_id=tokenizer.sep_token_id)
 
     if args.load_model_path is not None:
         logger.info("reload model from {}".format(args.load_model_path))
-        model.load_state_dict(torch.load(args.load_model_path, map_location=device))
+        model.load_state_dict(torch.load(args.load_model_path))
 
     model.to(device)
     if args.local_rank != -1:
@@ -253,17 +271,24 @@ def main():
         model = torch.nn.DataParallel(model)
 
     if args.do_train:
-        train_examples = read_examples(args.train_filename, 'cleaned_seqs')
-        train_features = convert_examples_to_features(train_examples, tokenizer, args,
-                                                      word_length=args.max_word_length,
-                                                      stat_length=args.max_stat_length)
+        train_examples = read_examples(args.train_filename, 'cleaned_seqs', 'cleaned_codes')
+        train_features = convert_examples_to_features(args, train_examples, tokenizer,
+                                                      code_length_ex=args.max_source_length_ex,
+                                                      code_length_ab=args.max_source_length_ab,
+                                                      stage='train')
 
-        all_source_ids = torch.tensor([f.source_ids for f in train_features], dtype=torch.long)
-        all_word_mask = torch.tensor([f.word_masks for f in train_features], dtype=torch.long)
-        all_stat_mask = torch.tensor([f.stat_masks for f in train_features], dtype=torch.long)
-        all_labels = torch.tensor([f.labels for f in train_features], dtype=torch.long)
+        all_ex_source_ids = torch.tensor([f.ex_source_ids for f in train_features], dtype=torch.long)
+        all_ex_source_mask = torch.tensor([f.ex_source_mask for f in train_features], dtype=torch.long)
 
-        train_data = TensorDataset(all_source_ids, all_word_mask, all_stat_mask, all_labels)
+        all_ab_source_ids = torch.tensor([f.ab_source_ids for f in train_features], dtype=torch.long)
+        all_ab_source_mask = torch.tensor([f.ab_source_mask for f in train_features], dtype=torch.long)
+
+        all_target_ids = torch.tensor([f.target_ids for f in train_features], dtype=torch.long)
+        all_target_mask = torch.tensor([f.target_mask for f in train_features], dtype=torch.long)
+
+        train_data = TensorDataset(all_ex_source_ids, all_ex_source_mask,
+                                   all_ab_source_ids, all_ab_source_mask,
+                                   all_target_ids, all_target_mask)
 
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
@@ -294,7 +319,10 @@ def main():
 
         model.train()
         dev_dataset = {}
-        nb_tr_examples, nb_tr_steps, tr_loss, tr_acc, global_step, best_acc, best_loss = 0, 0, 0, 0, 0, 0, 1e6
+        nb_tr_examples, nb_tr_steps = 0, 0
+        tr_loss, tr_ex_loss, tr_ab_loss, tr_acc, best_bleu = 0, 0, 0, 0, 0
+        global_step, best_acc, best_loss = 0, 0, 1e6
+
         bar = tqdm(range(num_train_optimization_steps), total=num_train_optimization_steps)
         train_dataloader = cycle(train_dataloader)
         eval_flag = True
@@ -303,24 +331,26 @@ def main():
         for step in bar:
             batch = next(train_dataloader)
             batch = tuple(t.to(device) for t in batch)
-            source_ids, word_masks, stat_masks, labels = batch
-            loss, _, num, active_labels, probs = model(source_ids, word_masks, stat_masks, labels)
+            ex_source_ids, ex_source_mask, ab_source_ids, ab_source_mask, target_ids, target_mask = batch
+
+            loss, _, _ = model(
+                ex_source_ids=ex_source_ids, ex_source_mask=ex_source_mask,
+                ab_source_ids=ab_source_ids, ab_source_mask=ab_source_mask,
+                target_ids=target_ids, target_mask=target_mask
+            )
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu.
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
+
             tr_loss += loss.item()
-            train_loss = np.round(tr_loss * args.gradient_accumulation_steps / (nb_tr_steps + 1), 4)
 
-            prediction = torch.argmax(probs, 1)
-            cur_acc = (prediction[active_labels] == labels.view(-1)[active_labels]).sum().float()
-            tr_acc += (cur_acc / num.sum()).cpu().detach().data.numpy()
-            train_acc = np.round(tr_acc * args.gradient_accumulation_steps / (nb_tr_steps + 1), 4)
+            train_loss = round(tr_loss * args.gradient_accumulation_steps / (nb_tr_steps + 1), 4)
 
-            bar.set_description("loss {}, acc {}".format(train_loss, train_acc))
+            bar.set_description("loss {}".format(train_loss))
 
-            nb_tr_examples += source_ids.size(0)
+            nb_tr_examples += ex_source_ids.size(0)
             nb_tr_steps += 1
             loss.backward()
 
@@ -334,21 +364,29 @@ def main():
 
             if args.do_eval and ((global_step + 1) % args.eval_steps == 0) and eval_flag:
                 # Eval model with dev dataset
-                tr_loss, tr_acc = 0, 0
+                tr_loss = 0
                 nb_tr_examples, nb_tr_steps = 0, 0
                 eval_flag = False
                 if 'dev_loss' in dev_dataset:
                     eval_examples, eval_data = dev_dataset['dev_loss']
                 else:
-                    eval_examples = read_examples(args.dev_filename, 'cleaned_seqs')
-                    eval_features = convert_examples_to_features(eval_examples, tokenizer, args,
-                                                                 word_length=args.max_word_length,
-                                                                 stat_length=args.max_stat_length)
-                    all_source_ids = torch.tensor([f.source_ids for f in eval_features], dtype=torch.long)
-                    all_word_mask = torch.tensor([f.word_masks for f in eval_features], dtype=torch.long)
-                    all_stat_mask = torch.tensor([f.stat_masks for f in eval_features], dtype=torch.long)
-                    all_labels = torch.tensor([f.labels for f in eval_features], dtype=torch.long)
-                    eval_data = TensorDataset(all_source_ids, all_word_mask, all_stat_mask, all_labels)
+                    eval_examples = read_examples(args.dev_filename, 'cleaned_seqs', 'cleaned_codes')
+                    eval_features = convert_examples_to_features(args, eval_examples, tokenizer,
+                                                                 code_length_ex=args.max_source_length_ex,
+                                                                 code_length_ab=args.max_source_length_ab,
+                                                                 stage='dev')
+                    all_ex_source_ids = torch.tensor([f.ex_source_ids for f in eval_features], dtype=torch.long)
+                    all_ex_source_mask = torch.tensor([f.ex_source_mask for f in eval_features], dtype=torch.long)
+
+                    all_ab_source_ids = torch.tensor([f.ab_source_ids for f in eval_features], dtype=torch.long)
+                    all_ab_source_mask = torch.tensor([f.ab_source_mask for f in eval_features], dtype=torch.long)
+
+                    all_target_ids = torch.tensor([f.target_ids for f in eval_features], dtype=torch.long)
+                    all_target_mask = torch.tensor([f.target_mask for f in eval_features], dtype=torch.long)
+
+                    eval_data = TensorDataset(all_ex_source_ids, all_ex_source_mask, all_ab_source_ids,
+                                              all_ab_source_mask, all_target_ids, all_target_mask)
+
                     dev_dataset['dev_loss'] = eval_examples, eval_data
 
                 eval_sampler = SequentialSampler(eval_data)
@@ -364,35 +402,26 @@ def main():
                 eval_acc, eval_step = 0, 0
                 for batch in eval_dataloader:
                     batch = tuple(t.to(device) for t in batch)
-                    source_ids, word_masks, stat_masks, labels = batch
+                    ex_source_ids, ex_source_mask, ab_source_ids, ab_source_mask, target_ids, target_mask = batch
 
                     with torch.no_grad():
-                        loss, _, num, active_labels, probs = model(source_ids, word_masks, stat_masks, labels)
-
-                    if args.n_gpu > 1:
-                        loss = loss.mean()
-                    if args.gradient_accumulation_steps > 1:
-                        loss = loss / args.gradient_accumulation_steps
+                        loss, _, _ = model(
+                            ex_source_ids=ex_source_ids, ex_source_mask=ex_source_mask,
+                            ab_source_ids=ab_source_ids, ab_source_mask=ab_source_mask,
+                            target_ids=target_ids, target_mask=target_mask
+                        )
 
                     eval_loss += loss.item()
-
-                    prediction = torch.argmax(probs, 1)
-                    cur_acc = (prediction[active_labels] == labels.view(-1)[active_labels]).sum().float()
-                    eval_acc += (cur_acc / num.sum()).cpu().detach().data.numpy()
-
                     eval_step += 1
-
-                print('preds', prediction[active_labels])
-                print('labels', labels.view(-1)[active_labels])
 
                 # Pring loss of dev dataset
                 model.train()
                 eval_loss = eval_loss / eval_step
-                eval_acc = eval_acc / eval_step
-                result = {'eval_loss': np.round(eval_loss, 5),
-                          'eval_acc': np.round(eval_acc, 5),
-                          'global_step': global_step + 1,
-                          'train_loss': np.round(train_loss, 5)}
+
+                result = {'eval loss': round(eval_loss, 5),
+                          'global step': global_step + 1,
+                          'train loss': round(train_loss, 5)}
+
                 for key in sorted(result.keys()):
                     logger.info("  %s = %s", key, str(result[key]))
                 logger.info("  " + "*" * 20)
@@ -406,7 +435,7 @@ def main():
                 torch.save(model_to_save.state_dict(), output_model_file)
 
                 if eval_loss < best_loss:
-                    logger.info("  Best loss:%s", np.round(eval_loss, 5))
+                    logger.info("  Best loss:%s", round(eval_loss, 5))
                     logger.info("  " + "*" * 20)
                     best_loss = eval_loss
                     # Save best checkpoint for best loss
@@ -417,12 +446,65 @@ def main():
                     output_model_file = os.path.join(output_dir, "pytorch_model.bin")
                     torch.save(model_to_save.state_dict(), output_model_file)
 
-                if eval_acc > best_acc:
-                    logger.info("  Best acc:%s", np.round(eval_acc, 5))
-                    logger.info("  " + "*" * 20)
-                    best_acc = eval_acc
+                # Calculate bleu
+                if 'dev_bleu' in dev_dataset:
+                    eval_examples, eval_data = dev_dataset['dev_bleu']
+                else:
+                    eval_examples = read_examples(args.dev_filename, 'cleaned_seqs', 'cleaned_codes')
+                    eval_examples = random.sample(eval_examples, min(1000, len(eval_examples)))
+                    eval_features = convert_examples_to_features(args, eval_examples, tokenizer,
+                                                                 code_length_ex=args.max_source_length_ex,
+                                                                 code_length_ab=args.max_source_length_ab,
+                                                                 stage='test')
 
-                    output_dir = os.path.join(args.output_dir, 'checkpoint-best-acc')
+                    all_ex_source_ids = torch.tensor([f.ex_source_ids for f in eval_features], dtype=torch.long)
+                    all_ex_source_mask = torch.tensor([f.ex_source_mask for f in eval_features], dtype=torch.long)
+
+                    all_ab_source_ids = torch.tensor([f.ab_source_ids for f in eval_features], dtype=torch.long)
+                    all_ab_source_mask = torch.tensor([f.ab_source_mask for f in eval_features], dtype=torch.long)
+
+                    eval_data = TensorDataset(all_ex_source_ids, all_ex_source_mask,
+                                              all_ab_source_ids, all_ab_source_mask)
+                    dev_dataset['dev_bleu'] = eval_examples, eval_data
+
+                eval_sampler = SequentialSampler(eval_data)
+                eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+                model.eval()
+                p = []
+                for batch in eval_dataloader:
+                    batch = tuple(t.to(device) for t in batch)
+                    ex_source_ids, ex_source_mask, ab_source_ids, ab_source_mask = batch
+                    with torch.no_grad():
+                        preds = model(ex_source_ids=ex_source_ids, ex_source_mask=ex_source_mask,
+                                      ab_source_ids=ab_source_ids, ab_source_mask=ab_source_mask)
+                        for pred in preds:
+                            t = pred[0].cpu().numpy()
+                            t = list(t)
+                            if 0 in t:
+                                t = t[:t.index(0)]
+                            text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
+                            p.append(text)
+
+                model.train()
+                predictions = []
+                with open(os.path.join(args.output_dir, "dev.output"), 'w') as f, open(
+                        os.path.join(args.output_dir, "dev.gold"), 'w') as f1:
+                    for ref, gold in zip(p, eval_examples):
+                        predictions.append(str(gold.idx) + '\t' + ref)
+                        f.write(str(gold.idx) + '\t' + ref + '\n')
+                        f1.write(str(gold.idx) + '\t' + gold.target + '\n')
+
+                (goldMap, predictionMap) = bleu.computeMaps(predictions, os.path.join(args.output_dir, "dev.gold"))
+                dev_bleu = round(bleu.bleuFromMaps(goldMap, predictionMap)[0], 2)
+                logger.info("  %s = %s " % ("bleu-4", str(dev_bleu)))
+                logger.info("  " + "*" * 20)
+                if dev_bleu > best_bleu:
+                    logger.info("  Best bleu:%s", dev_bleu)
+                    logger.info("  " + "*" * 20)
+                    best_bleu = dev_bleu
+                    # Save best checkpoint for best bleu
+                    output_dir = os.path.join(args.output_dir, 'checkpoint-best-bleu')
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
                     model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
@@ -439,68 +521,56 @@ def main():
         for idx, file in enumerate(files):
             logger.info("Test file: {}".format(file))
 
-            eval_examples = read_examples(file, 'cleaned_seqs')
-            eval_features = convert_examples_to_features(eval_examples, tokenizer, args,
-                                                         word_length=args.max_word_length,
-                                                         stat_length=args.max_stat_length)
-            all_source_ids = torch.tensor([f.source_ids for f in eval_features], dtype=torch.long)
-            all_word_mask = torch.tensor([f.word_masks for f in eval_features], dtype=torch.long)
-            all_stat_mask = torch.tensor([f.stat_masks for f in eval_features], dtype=torch.long)
-            all_labels = torch.tensor([f.labels for f in eval_features], dtype=torch.long)
-            eval_data = TensorDataset(all_source_ids, all_word_mask, all_stat_mask, all_labels)
+            eval_examples = read_examples(file, 'cleaned_seqs', 'cleaned_codes')
+            eval_features = convert_examples_to_features(args, eval_examples, tokenizer,
+                                                         code_length_ex=args.max_source_length_ex,
+                                                         code_length_ab=args.max_source_length_ab,
+                                                         stage='test')
+
+            all_ex_source_ids = torch.tensor([f.ex_source_ids for f in eval_features], dtype=torch.long)
+            all_ex_source_mask = torch.tensor([f.ex_source_mask for f in eval_features], dtype=torch.long)
+
+            all_ab_source_ids = torch.tensor([f.ab_source_ids for f in eval_features], dtype=torch.long)
+            all_ab_source_mask = torch.tensor([f.ab_source_mask for f in eval_features], dtype=torch.long)
+
+            eval_data = TensorDataset(all_ex_source_ids, all_ex_source_mask, all_ab_source_ids, all_ab_source_mask)
 
             eval_sampler = SequentialSampler(eval_data)
             eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
             model.eval()
-
-            eval_acc, eval_step = 0, 0
-
-            preds = []
-
+            p = []
             for batch in tqdm(eval_dataloader, total=len(eval_dataloader)):
                 batch = tuple(t.to(device) for t in batch)
-                source_ids, word_masks, stat_masks, labels = batch
-
+                ex_source_ids, ex_source_mask, ab_source_ids, ab_source_mask = batch
                 with torch.no_grad():
-                    _, _, num, active_labels, probs = model(source_ids, word_masks, stat_masks, labels)
-
-                prediction = torch.argmax(probs, 1)
-
-                preds.extend(prediction[active_labels].cpu().detach().data.numpy().tolist())
-
-                cur_acc = (prediction[active_labels] == labels.view(-1)[active_labels]).sum().float()
-                eval_acc += (cur_acc / num.sum()).cpu().detach().data.numpy()
-
-                eval_step += 1
-
-            if args.do_save_ex:
-                save_ex_stat(file, preds, args.max_stat_length)
-
-            # print('preds', prediction[active_labels])
-            # print('labels', labels.view(-1)[active_labels])
+                    preds = model(ex_source_ids=ex_source_ids, ex_source_mask=ex_source_mask,
+                                  ab_source_ids=ab_source_ids, ab_source_mask=ab_source_mask)
+                    for pred in preds:
+                        t = pred[0].cpu().numpy()
+                        t = list(t)
+                        if 0 in t:
+                            t = t[:t.index(0)]
+                        text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
+                        p.append(text)
 
             model.train()
-            eval_acc = eval_acc / eval_step
+            predictions = []
 
-            result = {'test acc': np.round(eval_acc, 5)}
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
+            with open(os.path.join(args.output_dir, "test_{}.output".format(str(idx))), 'w') as f, open(
+                    os.path.join(args.output_dir, "test_{}.gold".format(str(idx))), 'w') as f1:
+                for ref, gold in zip(p, eval_examples):
+                    predictions.append(str(gold.idx) + '\t' + ref)
+                    f.write(str(gold.idx) + '\t' + ref + '\n')
+                    f1.write(str(gold.idx) + '\t' + gold.target + '\n')
+
+            (goldMap, predictionMap) = bleu.computeMaps(predictions,
+                                                        os.path.join(args.output_dir, "test_{}.gold".format(idx)))
+            dev_bleu = round(bleu.bleuFromMaps(goldMap, predictionMap)[0], 2)
+            logger.info("  %s = %s " % ("bleu-4", str(dev_bleu)))
             logger.info("  " + "*" * 20)
 
 
-def save_ex_stat(filename, preds, max_stat_len):
-    with open(filename, encoding="utf-8") as f, jsonlines.open('test-python.jsonl', 'w') as writer:
-        pred_idx = 0
-        for idx, line in tqdm(enumerate(f)):
-            line = line.strip()
-            js = json.loads(line)
-
-            stat_len = min(len(js['cleaned_seqs']), max_stat_len)
-
-            js['cleaned_seqs_pred'] = preds[pred_idx:pred_idx + stat_len]
-            pred_idx += stat_len
-            writer.write(js)
-
 if __name__ == "__main__":
-    main()
+    language = sys.argv[1]
+    main(language)

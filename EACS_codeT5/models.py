@@ -5,11 +5,6 @@ from transformers import (RobertaConfig, RobertaModel, RobertaTokenizer,
                           BartConfig, BartForConditionalGeneration, BartTokenizer,
                           T5Config, T5ForConditionalGeneration, T5Tokenizer)
 import logging
-import platform
-
-sysstr = platform.system()
-
-transformer_path = r'I:\project\hugging-face-base\codet5-base'
 
 logger = logging.getLogger(__name__)
 
@@ -27,27 +22,17 @@ def get_model_size(model):
 
 def build_or_load_gen_model(args):
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    if sysstr == 'Linux':
-        config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
-        tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name)
-    elif sysstr == 'Windows':
-        config = config_class.from_pretrained(transformer_path)
-        tokenizer = tokenizer_class.from_pretrained(transformer_path)
+    config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
+    tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name)
     if args.model_type == 'roberta':
-        if sysstr == 'Linux':
-            encoder = model_class.from_pretrained(args.model_name_or_path, config=config)
-        elif sysstr == 'Windows':
-            encoder = model_class.from_pretrained(transformer_path)
+        encoder = model_class.from_pretrained(args.model_name_or_path, config=config)
         decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
         decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
         model = Seq2Seq(encoder=encoder, decoder=decoder, config=config,
                         beam_size=args.beam_size, max_length=args.max_target_length,
                         sos_id=tokenizer.cls_token_id, eos_id=tokenizer.sep_token_id)
     else:
-        if sysstr == 'Linux':
-            model = model_class.from_pretrained(args.model_name_or_path)
-        elif sysstr == 'Windows':
-            model = model_class.from_pretrained(transformer_path)
+        model = model_class.from_pretrained(args.model_name_or_path)
 
     logger.info("Finish loading model [%s] from %s", get_model_size(model), args.model_name_or_path)
 
