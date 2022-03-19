@@ -1,7 +1,3 @@
-#!/usr/bin/env python
-
-# Python wrapper for METEOR implementation, by Xinlei Chen
-# Acknowledge Michael Denkowski for the generous discussion and help 
 
 import os
 import sys

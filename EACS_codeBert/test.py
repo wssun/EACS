@@ -92,9 +92,6 @@ def read_examples(filename, ex_dataset, ab_dataset):
                 )
             )
 
-            # if idx > 300:
-            #     break
-
     return examples
 
 

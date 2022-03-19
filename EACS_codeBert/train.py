@@ -237,10 +237,6 @@ def main(language):
     if os.path.exists(args.output_dir) is False:
         os.makedirs(args.output_dir)
 
-    config = None
-    tokenizer = None
-    encoder = None
-
     config = RobertaConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
     tokenizer = RobertaTokenizer.from_pretrained(
         args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,

@@ -1,21 +1,3 @@
-#!/usr/bin/env python
-
-# bleu_scorer.py
-# David Chiang <chiang@isi.edu>
-
-# Copyright (c) 2004-2006 University of Maryland. All rights
-# reserved. Do not redistribute without permission from the
-# author. Not for commercial use.
-
-# Modified by: 
-# Hao Fang <hfang@uw.edu>
-# Tsung-Yi Lin <tl483@cornell.edu>
-
-'''Provides:
-cook_refs(refs, n=4): Transform a list of reference sentences as strings into a form usable by cook_test().
-cook_test(test, refs, n=4): Transform a test sentence as a string (together with the cooked reference sentences) into a form usable by score_cooked().
-'''
-
 import copy
 import sys, math, re
 from collections import defaultdict
