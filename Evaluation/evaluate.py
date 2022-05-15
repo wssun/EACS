@@ -6,7 +6,7 @@ from meteor.meteor import Meteor
 import numpy as np
 import sys
 
-from evaluation.codeBERT_eval.bleu import computeMaps, bleuFromMaps
+from bleu.bleu import computeMaps, bleuFromMaps
 
 
 def main(hyp, ref, len):
@@ -20,12 +20,6 @@ def main(hyp, ref, len):
     with open(ref, 'r') as r:
         references = r.readlines()
         gts = {k: [" ".join(v.strip().lower().split()[1:])] for k, v in enumerate(references)}
-
-    score_Bleu, scores_Bleu = Bleu(4).compute_score(gts, res)
-    print("Bleu_1: "), np.mean(scores_Bleu[0])
-    print("Bleu_2: "), np.mean(scores_Bleu[1])
-    print("Bleu_3: "), np.mean(scores_Bleu[2])
-    print("Bleu_4: "), np.mean(scores_Bleu[3])
 
     score_Meteor, scores_Meteor = Meteor().compute_score(gts, res)
     print("Meteor: "), score_Meteor
