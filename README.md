@@ -9,11 +9,12 @@ pip install -r requirements.txt
 ```
 
 ## Original Dataset
-The CodeSearchNet original dataset can be downloaded from the github repo: [https://github.com/github/CodeSearchNet](https://github.com/github/CodeSearchNet), and the cleaned dataset can be downloaded from the [https://drive.google.com/open?id=1rd2Tc6oUWBo7JouwexW3ksQ0PaOhUr6h](https://drive.google.com/open?id=1rd2Tc6oUWBo7JouwexW3ksQ0PaOhUr6h)
+The CodeSearchNet original dataset can be downloaded from the github repo: [https://github.com/github/CodeSearchNet](https://github.com/github/CodeSearchNet), and the cleaned dataset (CodeXGLUE) can be downloaded from the [https://drive.google.com/open?id=1rd2Tc6oUWBo7JouwexW3ksQ0PaOhUr6h](https://drive.google.com/open?id=1rd2Tc6oUWBo7JouwexW3ksQ0PaOhUr6h)
 
 The JCSD and PCSD dataset can be downloaded from the github repo: [https://github.com/xing-hu/TL-CodeSum](https://github.com/xing-hu/TL-CodeSum) and [https://github.com/wanyao1992/code_summarization_public](https://github.com/wanyao1992/code_summarization_public)
 
 ## Quick Start
+### Extractor
 Run the `Extractor_ classifier/make_label/make_dataset_label.py` to generate the classification labels for classifier training.
 
 For example:
@@ -41,7 +42,21 @@ cd Extractor_ classifier/
 python classifier.py {language}
 ```
 
-The {language} can be selected in `java, python, go, php, ruby, javascript`
+The {language} can be selected in `java, python, go, php, ruby, javascript, JCSD, PCSD`
+
+the output samples are as follows:
+```
+- output samples:
+{
+    "idx":0, 
+    "code_tokens":["private", "int", "currentDepth", ...], 
+    "docstring_tokens": ["returns", "a", "0", ...],  
+    ...,  
+    "ex_labels": [1, 0, 1, ...], 
+    "cleaned_seqs_pred": [1, 0, 1, ...] 
+}
+...
+```
 
 ### EACS + CodeBert
 To train the EACS CodeBert model:
@@ -57,7 +72,7 @@ To test and output the EACS CodeBert results:
 python test.py {language}
 ```
 
-The {language} can be selected in `java, python, go, php, ruby, javascript`
+The {language} can be selected in `java, python, go, php, ruby, javascript, JCSD, PCSD`
 
 ### EACS + CodeT5
 
@@ -69,7 +84,7 @@ cd EACS_codeT5/
 python run_gen.py {language}
 ```
 
-The {language} can be selected in `java, python, go, php, ruby, javascript`
+The {language} can be selected in `java, python, go, php, ruby, javascript, JCSD, PCSD`
 
 ### Evaluation
 After trainning the EACS + CodeBert and EACS + CodeT5 models, run the evaluation code to output Bleu, Meteor and Rouge-L:
